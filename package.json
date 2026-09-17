@@ -39,5 +39,13 @@
   },
   "devDependencies": {
     "node-gyp": "^11.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fabioriva/snap7-node-addon-api.git"
+  },
+  "homepage": "https://github.com/fabioriva/snap7-node-addon-api#readme",
+  "bugs": {
+    "url": "https://github.com/fabioriva/snap7-node-addon-api/issues"
   }
 }
