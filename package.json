@@ -1,6 +1,6 @@
 {
   "name": "snap7-node-addon-api",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Asynchronous Node-API bindings for the Snap7 S7 client",
   "main": "index.js",
   "types": "index.d.ts",
