@@ -164,11 +164,12 @@ void TMsgSocket::Purge()
     int Read;
     if (LastTcpError!=WSAECONNRESET)
     {
-        if (CanRead(0)) {
-           do
-           {
-               Read=recv(FSocket, Trash, 512, MSG_NOSIGNAL );
-           } while(Read==512);
+        // Keep draining bounded even when the peer continues sending.
+        for (int i = 0; i < 16 && CanRead(0); ++i)
+        {
+            Read=recv(FSocket, Trash, sizeof(Trash), MSG_NOSIGNAL);
+            if (Read < int(sizeof(Trash)))
+                break;
         }
     }
 }
@@ -295,6 +296,13 @@ bool TMsgSocket::CanWrite(int Timeout)
     TimeV.tv_usec = (Timeout % 1000) * 1000;
     TimeV.tv_sec = Timeout / 1000;
 
+#ifdef PLATFORM_UNIX
+    if (FSocket >= FD_SETSIZE)
+    {
+        LastTcpError = WSAEINVAL;
+        return false;
+    }
+#endif
     FD_ZERO(&FDset);
     FD_SET(FSocket, &FDset);
 
@@ -319,6 +327,13 @@ bool TMsgSocket::CanRead(int Timeout)
 	TimeV.tv_usec = (Timeout % 1000) * 1000;
     TimeV.tv_sec = Timeout / 1000;
 
+#ifdef PLATFORM_UNIX
+    if (FSocket >= FD_SETSIZE)
+    {
+        LastTcpError = WSAEINVAL;
+        return false;
+    }
+#endif
     FD_ZERO(&FDset);
     FD_SET(FSocket, &FDset);
 
@@ -346,6 +361,10 @@ int TMsgSocket::SckConnect()
 
 	if (LastTcpError == 0) {
 		CreateSocket();
+		if (LastTcpError == 0 && FSocket >= FD_SETSIZE) {
+			ForceClose();
+			LastTcpError = WSAEINVAL;
+		}
 		if (LastTcpError == 0) {
 			flags = fcntl(FSocket, F_GETFL, 0);
 			if (flags >= 0) {
@@ -414,37 +433,75 @@ int TMsgSocket::SckConnect()
 		} //valid socket 
 	} // LastTcpError==0
 	Connected=LastTcpError==0;
+	if (!Connected)
+	{
+		const int Error = LastTcpError;
+		ForceClose();
+		LastTcpError = Error;
+	}
  	return LastTcpError;
 }
 #else
 //
-// Regular connection (Windows)
+// Bounded TCP connection (Windows), independent of ICMP reachability.
 //
 int TMsgSocket::SckConnect()
 {
-    int Result;
+    Connected = false;
     SetSin(RemoteSin, RemoteAddress, RemotePort);
-    if (LastTcpError==0)
+    if (LastTcpError != 0)
+        return LastTcpError;
+
+    CreateSocket();
+    if (LastTcpError != 0)
+        return LastTcpError;
+
+    u_long NonBlocking = 1;
+    if (ioctlsocket(FSocket, FIONBIO, &NonBlocking) == SOCKET_ERROR)
+        LastTcpError = GetLastSocketError();
+    else if (connect(FSocket, (struct sockaddr*)&RemoteSin, sizeof(RemoteSin)) == SOCKET_ERROR)
     {
-        if (Ping(RemoteSin))
+        LastTcpError = GetLastSocketError();
+        if (LastTcpError == WSAEWOULDBLOCK)
         {
-            CreateSocket();
-            if (LastTcpError==0)
+            fd_set WriteSet, ErrorSet;
+            FD_ZERO(&WriteSet);
+            FD_SET(FSocket, &WriteSet);
+            ErrorSet = WriteSet;
+            timeval Timeout = {PingTimeout / 1000, (PingTimeout % 1000) * 1000};
+            const int Ready = select(0, NULL, &WriteSet, &ErrorSet,
+                                     PingTimeout ? &Timeout : NULL);
+            if (Ready == SOCKET_ERROR)
+                LastTcpError = GetLastSocketError();
+            else if (Ready == 0)
+                LastTcpError = WSAETIMEDOUT;
+            else
             {
-                Result=connect(FSocket, (struct sockaddr*)&RemoteSin, sizeof(RemoteSin));
-                if (SockCheck(Result)==0)
-                {
-                    GetLocal();
-                    // Client handle is self_address (here the connection is ACTIVE)
-                    ClientHandle=LocalSin.sin_addr.s_addr;
-                }
+                int Error = 0;
+                int Length = sizeof(Error);
+                if (getsockopt(FSocket, SOL_SOCKET, SO_ERROR, (char*)&Error, &Length) == SOCKET_ERROR)
+                    LastTcpError = GetLastSocketError();
+                else
+                    LastTcpError = Error;
             }
         }
-        else
-            LastTcpError=WSAEHOSTUNREACH;
     }
-    Connected=LastTcpError==0;
-    return LastTcpError;
+
+    NonBlocking = 0;
+    if (LastTcpError == 0 &&
+        ioctlsocket(FSocket, FIONBIO, &NonBlocking) == SOCKET_ERROR)
+        LastTcpError = GetLastSocketError();
+    if (LastTcpError != 0)
+    {
+        const int Error = LastTcpError;
+        ForceClose();
+        return LastTcpError = Error;
+    }
+
+    GetLocal();
+    ClientHandle = LocalSin.sin_addr.s_addr;
+    Connected = true;
+    return 0;
 }
 #endif
 //---------------------------------------------------------------------------
@@ -528,8 +585,6 @@ socket_t TMsgSocket::SckAccept()
 //---------------------------------------------------------------------------
 int TMsgSocket::SendPacket(void *Data, int Size)
 {
-    int Result;
-    
     LastTcpError=0;
     if (SendTimeout>0)
     {
@@ -539,13 +594,16 @@ int TMsgSocket::SendPacket(void *Data, int Size)
             return LastTcpError;
         }
     }
-    if (send(FSocket, (char*)Data, Size, MSG_NOSIGNAL)==Size)
+    const int Sent = send(FSocket, (char*)Data, Size, MSG_NOSIGNAL);
+    if (Sent == Size)
         return 0;
-    else
-        Result =SOCKET_ERROR;
+    if (Sent < 0)
+        return SockCheck(SOCKET_ERROR);
 
-    SockCheck(Result);
-    return Result;
+    // The caller cannot retry a frame after it has been partially sent.
+    ForceClose();
+    Connected = false;
+    return LastTcpError = WSAECONNRESET;
 }
 //---------------------------------------------------------------------------
 bool TMsgSocket::PacketReady(int Size)
@@ -584,11 +642,14 @@ int TMsgSocket::RecvPacket(void *Data, int Size)
     if (LastTcpError==0)
     {
         BytesRead=recv(FSocket, (char*)Data, Size, MSG_NOSIGNAL);
-        if (BytesRead==0)
-            LastTcpError = WSAECONNRESET;  // Connection reset by Peer
-        else
-            if (BytesRead<0)
-                LastTcpError = GetLastSocketError();
+        if (BytesRead < 0)
+            LastTcpError = GetLastSocketError();
+        else if (BytesRead != Size)
+        {
+            // A partial frame cannot be processed as a full receive.
+            ForceClose();
+            LastTcpError = WSAECONNRESET;
+        }
     }
     else // After the timeout the bytes waiting were less then we expected
         if (LastTcpError==WSAETIMEDOUT)
@@ -761,6 +822,10 @@ bool TRawSocketPinger::CanRead(int Timeout)
     TimeV.tv_usec = (Timeout % 1000) * 1000;
     TimeV.tv_sec = Timeout / 1000;
 
+#ifdef PLATFORM_UNIX
+    if (FSocket >= FD_SETSIZE)
+        return false;
+#endif
     FD_ZERO(&FDset);
     FD_SET(FSocket, &FDset);
 

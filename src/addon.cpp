@@ -8,13 +8,22 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "s7_client.h"
 #include "s7_text.h"
 #include "s7_types.h"
 
+#ifdef OS_WINDOWS
+#include <ws2tcpip.h>
+#endif
+
 namespace {
+
+constexpr int kMaxS7Address = 0xFFFFFF;
+constexpr int kMaxTransferBytes = (kMaxS7Address + 1) / 8;
+constexpr int kMaxDbNumber = 0xFFFF;
 
 std::string ClientErrorText(int code) {
   char text[1024] = {0};
@@ -25,38 +34,15 @@ std::string ClientErrorText(int code) {
 struct ClientState {
   ClientState() : client(std::make_unique<TSnap7Client>()) {}
 
-  ~ClientState() {
-    std::lock_guard<std::mutex> lock(mutex);
-    client->Disconnect();
-  }
+  ~ClientState() { client->ForceClose(); }
 
   std::mutex mutex;
   std::unique_ptr<TSnap7Client> client;
   std::atomic<bool> connected{false};
 };
 
-int WordSize(int word_len) {
-  switch (word_len) {
-    case S7WLBit:
-    case S7WLByte:
-    case S7WLChar:
-      return 1;
-    case S7WLWord:
-    case S7WLInt:
-    case S7WLCounter:
-    case S7WLTimer:
-      return 2;
-    case S7WLDWord:
-    case S7WLDInt:
-    case S7WLReal:
-      return 4;
-    default:
-      return 0;
-  }
-}
-
 bool ReadInt(const Napi::CallbackInfo& info, size_t index, const char* name,
-             int minimum, int* value) {
+             int minimum, int* value, int maximum = INT_MAX) {
   Napi::Env env = info.Env();
   if (index >= info.Length() || !info[index].IsNumber()) {
     Napi::TypeError::New(env, std::string(name) + " must be a number")
@@ -66,7 +52,7 @@ bool ReadInt(const Napi::CallbackInfo& info, size_t index, const char* name,
 
   double number = info[index].As<Napi::Number>().DoubleValue();
   if (!std::isfinite(number) || number != std::trunc(number) ||
-      number < minimum || number > INT_MAX) {
+      number < minimum || number > maximum) {
     Napi::RangeError::New(env, std::string(name) + " is out of range")
         .ThrowAsJavaScriptException();
     return false;
@@ -76,25 +62,59 @@ bool ReadInt(const Napi::CallbackInfo& info, size_t index, const char* name,
   return true;
 }
 
-bool ReadBytes(const Napi::CallbackInfo& info, size_t index,
-               std::vector<uint8_t>* bytes) {
-  Napi::Env env = info.Env();
-  if (index >= info.Length() || !info[index].IsTypedArray()) {
-    Napi::TypeError::New(env, "data must be a Buffer or Uint8Array")
-        .ThrowAsJavaScriptException();
-    return false;
+Napi::Uint8Array ReadBytes(const Napi::CallbackInfo& info, size_t index) {
+  const auto value = info[index];
+  if (!value.IsTypedArray() ||
+      value.As<Napi::TypedArray>().TypedArrayType() != napi_uint8_array) {
+    throw Napi::TypeError::New(info.Env(), "data must be a Buffer or Uint8Array");
   }
 
-  Napi::TypedArray array = info[index].As<Napi::TypedArray>();
-  if (array.TypedArrayType() != napi_uint8_array) {
-    Napi::TypeError::New(env, "data must be a Buffer or Uint8Array")
-        .ThrowAsJavaScriptException();
-    return false;
+  const auto data = value.As<Napi::Uint8Array>();
+  if (!data.ArrayBuffer().IsArrayBuffer()) {
+    throw Napi::TypeError::New(info.Env(), "data must use an ArrayBuffer");
+  }
+  if (data.ByteLength() == 0 || data.ByteLength() > kMaxTransferBytes) {
+    throw Napi::RangeError::New(info.Env(), "data length is out of range");
+  }
+  return data;
+}
+
+size_t ValidateTransfer(Napi::Env env, int area, int db_number, int start,
+                        int amount, int word_len) {
+  switch (area) {
+    case S7AreaPE:
+    case S7AreaPA:
+    case S7AreaMK:
+    case S7AreaDB:
+    case S7AreaCT:
+    case S7AreaTM:
+      break;
+    default:
+      throw Napi::RangeError::New(env, "invalid area");
+  }
+  if (area != S7AreaDB && db_number != 0) {
+    throw Napi::RangeError::New(env, "dbNumber must be zero outside Area.DB");
+  }
+  const int word_size = TSnap7Client::DataSizeByte(word_len);
+  if (word_size == 0 || (word_len == S7WLBit && amount != 1) ||
+      ((area == S7AreaCT) != (word_len == S7WLCounter)) ||
+      ((area == S7AreaTM) != (word_len == S7WLTimer))) {
+    throw Napi::RangeError::New(env, "invalid wordLen or bit amount for area");
   }
 
-  Napi::Uint8Array data = info[index].As<Napi::Uint8Array>();
-  bytes->assign(data.Data(), data.Data() + data.ByteLength());
-  return true;
+  const auto bytes = static_cast<size_t>(amount) * word_size;
+  const bool indexed = word_len == S7WLBit || area == S7AreaCT || area == S7AreaTM;
+  const size_t end = static_cast<size_t>(start) + (indexed ? amount : bytes);
+  const size_t limit = indexed ? kMaxS7Address + 1 : kMaxTransferBytes;
+  if (bytes > kMaxTransferBytes || end > limit) {
+    throw Napi::RangeError::New(env, "transfer exceeds the S7 address range");
+  }
+  return bytes;
+}
+
+std::vector<uint8_t> CopyBytes(const Napi::Uint8Array& data) {
+  const auto* start = data.Data();
+  return {start, start + data.ByteLength()};
 }
 
 class ClientWorker : public Napi::AsyncWorker {
@@ -116,24 +136,43 @@ class ClientWorker : public Napi::AsyncWorker {
     }
   }
 
-  void OnOK() final { deferred_.Resolve(Result(Env())); }
+  void OnOK() final {
+    try {
+      deferred_.Resolve(Result(Env()));
+    } catch (const Napi::Error& error) {
+      deferred_.Reject(error.Value());
+    }
+  }
 
   void OnError(const Napi::Error& error) final {
     Napi::Object value = error.Value();
-    value.Set("name", "Snap7Error");
-    value.Set("code", Napi::Number::New(Env(), error_code_));
+    if (error_code_ != 0) {
+      value.Set("name", "Snap7Error");
+      value.Set("code", Napi::Number::New(Env(), error_code_));
+      DescribeError(value);
+    }
     deferred_.Reject(value);
   }
 
  protected:
   virtual int ExecuteLocked(TSnap7Client& client) = 0;
   virtual Napi::Value Result(Napi::Env env) { return env.Undefined(); }
+  virtual void DescribeError(Napi::Object) {}
 
  private:
   Napi::Promise::Deferred deferred_;
   std::shared_ptr<ClientState> state_;
   int error_code_ = 0;
 };
+
+template <typename Worker, typename... Args>
+Napi::Promise QueueWorker(Args&&... args) {
+  auto worker = std::make_unique<Worker>(std::forward<Args>(args)...);
+  auto promise = worker->Promise();
+  worker->Queue();
+  worker.release();
+  return promise;
+}
 
 class ConnectWorker final : public ClientWorker {
  public:
@@ -239,11 +278,15 @@ class WriteWorker final : public ClientWorker {
 
  protected:
   int ExecuteLocked(TSnap7Client& client) override {
-    if (kind_ == Kind::Db) {
-      return client.DBWrite(db_number_, start_, amount_, data_.data());
-    }
-    return client.WriteArea(area_, db_number_, start_, amount_, word_len_,
-                            data_.data());
+    const int result = kind_ == Kind::Db
+        ? client.DBWrite(db_number_, start_, amount_, data_.data())
+        : client.WriteArea(area_, db_number_, start_, amount_, word_len_, data_.data());
+    bytes_written_ = client.LastWriteBytes;
+    return result;
+  }
+
+  void DescribeError(Napi::Object error) override {
+    error.Set("bytesWritten", Napi::Number::New(error.Env(), bytes_written_));
   }
 
  private:
@@ -253,6 +296,7 @@ class WriteWorker final : public ClientWorker {
   int start_;
   int amount_;
   int word_len_ = S7WLByte;
+  size_t bytes_written_ = 0;
   std::vector<uint8_t> data_;
 };
 
@@ -286,26 +330,23 @@ class NativeS7Client final : public Napi::ObjectWrap<NativeS7Client> {
     }
     int rack;
     int slot;
-    if (!ReadInt(info, 1, "rack", 0, &rack) ||
-        !ReadInt(info, 2, "slot", 0, &slot)) {
+    if (!ReadInt(info, 1, "rack", 0, &rack, 7) ||
+        !ReadInt(info, 2, "slot", 0, &slot, 31)) {
       return env.Undefined();
     }
     std::string address = info[0].As<Napi::String>().Utf8Value();
-    if (address.empty() || address.size() > 15) {
+    in_addr parsed{};
+    if (address.size() > 15 || address.find('\0') != std::string::npos ||
+        inet_pton(AF_INET, address.c_str(), &parsed) != 1) {
       Napi::RangeError::New(env, "address must be an IPv4 address")
           .ThrowAsJavaScriptException();
       return env.Undefined();
     }
-    auto* worker =
-        new ConnectWorker(env, state_, std::move(address), rack, slot);
-    worker->Queue();
-    return worker->Promise();
+    return QueueWorker<ConnectWorker>(env, state_, std::move(address), rack, slot);
   }
 
   Napi::Value Disconnect(const Napi::CallbackInfo& info) {
-    auto* worker = new DisconnectWorker(info.Env(), state_);
-    worker->Queue();
-    return worker->Promise();
+    return QueueWorker<DisconnectWorker>(info.Env(), state_);
   }
 
   Napi::Value DbRead(const Napi::CallbackInfo& info) {
@@ -313,35 +354,27 @@ class NativeS7Client final : public Napi::ObjectWrap<NativeS7Client> {
     int db_number;
     int start;
     int size;
-    if (!ReadInt(info, 0, "dbNumber", 0, &db_number) ||
+    if (!ReadInt(info, 0, "dbNumber", 0, &db_number, kMaxDbNumber) ||
         !ReadInt(info, 1, "start", 0, &start) ||
         !ReadInt(info, 2, "size", 1, &size)) {
       return env.Undefined();
     }
-    auto* worker = new ReadWorker(env, state_, db_number, start, size);
-    worker->Queue();
-    return worker->Promise();
+    ValidateTransfer(env, S7AreaDB, db_number, start, size, S7WLByte);
+    return QueueWorker<ReadWorker>(env, state_, db_number, start, size);
   }
 
   Napi::Value DbWrite(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     int db_number;
     int start;
-    std::vector<uint8_t> data;
-    if (!ReadInt(info, 0, "dbNumber", 0, &db_number) ||
-        !ReadInt(info, 1, "start", 0, &start) ||
-        !ReadBytes(info, 2, &data)) {
+    if (!ReadInt(info, 0, "dbNumber", 0, &db_number, kMaxDbNumber) ||
+        !ReadInt(info, 1, "start", 0, &start)) {
       return env.Undefined();
     }
-    if (data.empty() || data.size() > static_cast<size_t>(INT_MAX)) {
-      Napi::RangeError::New(env, "data length is out of range")
-          .ThrowAsJavaScriptException();
-      return env.Undefined();
-    }
-    auto* worker =
-        new WriteWorker(env, state_, db_number, start, std::move(data));
-    worker->Queue();
-    return worker->Promise();
+    const auto data = ReadBytes(info, 2);
+    ValidateTransfer(env, S7AreaDB, db_number, start,
+                     static_cast<int>(data.ByteLength()), S7WLByte);
+    return QueueWorker<WriteWorker>(env, state_, db_number, start, CopyBytes(data));
   }
 
   Napi::Value ReadArea(const Napi::CallbackInfo& info) {
@@ -352,28 +385,15 @@ class NativeS7Client final : public Napi::ObjectWrap<NativeS7Client> {
     int amount;
     int word_len;
     if (!ReadInt(info, 0, "area", 0, &area) ||
-        !ReadInt(info, 1, "dbNumber", 0, &db_number) ||
+        !ReadInt(info, 1, "dbNumber", 0, &db_number, kMaxDbNumber) ||
         !ReadInt(info, 2, "start", 0, &start) ||
         !ReadInt(info, 3, "amount", 1, &amount) ||
         !ReadInt(info, 4, "wordLen", 0, &word_len)) {
       return env.Undefined();
     }
-    int word_size = WordSize(word_len);
-    if (word_size == 0 || (word_len == S7WLBit && amount != 1)) {
-      Napi::RangeError::New(env, "invalid wordLen or bit amount")
-          .ThrowAsJavaScriptException();
-      return env.Undefined();
-    }
-    size_t size = static_cast<size_t>(amount) * word_size;
-    if (size > static_cast<size_t>(INT_MAX)) {
-      Napi::RangeError::New(env, "requested buffer is too large")
-          .ThrowAsJavaScriptException();
-      return env.Undefined();
-    }
-    auto* worker = new ReadWorker(env, state_, area, db_number, start, amount,
-                                  word_len, size);
-    worker->Queue();
-    return worker->Promise();
+    const size_t size = ValidateTransfer(env, area, db_number, start, amount, word_len);
+    return QueueWorker<ReadWorker>(env, state_, area, db_number, start,
+                                   amount, word_len, size);
   }
 
   Napi::Value WriteArea(const Napi::CallbackInfo& info) {
@@ -382,33 +402,24 @@ class NativeS7Client final : public Napi::ObjectWrap<NativeS7Client> {
     int db_number;
     int start;
     int word_len;
-    std::vector<uint8_t> data;
     if (!ReadInt(info, 0, "area", 0, &area) ||
-        !ReadInt(info, 1, "dbNumber", 0, &db_number) ||
+        !ReadInt(info, 1, "dbNumber", 0, &db_number, kMaxDbNumber) ||
         !ReadInt(info, 2, "start", 0, &start) ||
-        !ReadInt(info, 3, "wordLen", 0, &word_len) ||
-        !ReadBytes(info, 4, &data)) {
+        !ReadInt(info, 3, "wordLen", 0, &word_len)) {
       return env.Undefined();
     }
-    int word_size = WordSize(word_len);
-    if (word_size == 0 || data.empty() ||
-        data.size() % static_cast<size_t>(word_size) != 0 ||
-        (word_len == S7WLBit && data.size() != 1)) {
-      Napi::RangeError::New(env, "data length does not match wordLen")
-          .ThrowAsJavaScriptException();
-      return env.Undefined();
+    const auto data = ReadBytes(info, 4);
+    const int word_size = TSnap7Client::DataSizeByte(word_len);
+    if (word_size == 0 || data.ByteLength() % word_size != 0) {
+      throw Napi::RangeError::New(env, "data length does not match wordLen");
     }
-    size_t amount_size = data.size() / static_cast<size_t>(word_size);
-    if (amount_size > static_cast<size_t>(INT_MAX)) {
-      Napi::RangeError::New(env, "data is too large")
-          .ThrowAsJavaScriptException();
-      return env.Undefined();
+    const int amount = static_cast<int>(data.ByteLength() / word_size);
+    ValidateTransfer(env, area, db_number, start, amount, word_len);
+    if (word_len == S7WLBit && data[0] > 1) {
+      throw Napi::RangeError::New(env, "a bit must be 0 or 1");
     }
-    auto* worker = new WriteWorker(env, state_, area, db_number, start,
-                                   static_cast<int>(amount_size), word_len,
-                                   std::move(data));
-    worker->Queue();
-    return worker->Promise();
+    return QueueWorker<WriteWorker>(env, state_, area, db_number, start, amount,
+                                    word_len, CopyBytes(data));
   }
 
   Napi::Value Connected(const Napi::CallbackInfo& info) {
@@ -458,6 +469,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("NativeS7Client", NativeS7Client::Define(env));
   exports.Set("Area", MakeArea(env));
   exports.Set("WordLen", MakeWordLen(env));
+  exports.Set("maxTransferBytes", kMaxTransferBytes);
   exports.Set("errorText", Napi::Function::New(env, ErrorText));
   return exports;
 }

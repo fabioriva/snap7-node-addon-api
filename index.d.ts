@@ -1,6 +1,10 @@
+import type { Buffer } from 'node:buffer';
+
 export interface Snap7Error extends Error {
   /** Numeric error returned by Snap7. */
   code: number;
+  /** Bytes acknowledged by the PLC before a write failed. */
+  bytesWritten?: number;
 }
 
 export declare const Area: Readonly<{

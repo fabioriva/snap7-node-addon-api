@@ -31,6 +31,7 @@ TSnap7Peer::TSnap7Peer()
     PDUH_out=PS7ReqHeader(&PDU.Payload);
     PDURequest=480; // Our request, FPDULength will contain the CPU answer
     LastError=0;
+    PDULength=0;
 	cntword = 0;
     Destroying = false;
 }
@@ -76,7 +77,8 @@ int TSnap7Peer::NegotiatePDULength( )
     PDUH_out->P        = 0x32;            // Always $32
     PDUH_out->PDUType  = PduType_request; // $01
     PDUH_out->AB_EX    = 0x0000;          // Always $0000
-    PDUH_out->Sequence = GetNextWord();   // AutoInc
+    const word Sequence = GetNextWord();
+    PDUH_out->Sequence = Sequence;
     PDUH_out->ParLen   = SwapWord(sizeof(TReqFunNegotiateParams)); // 8 bytes
     PDUH_out->DataLen  = 0x0000;
     // Params
@@ -87,21 +89,30 @@ int TSnap7Peer::NegotiatePDULength( )
     ReqNegotiate->PDULength = SwapWord(PDURequest);
     IsoSize = sizeof( TS7ReqHeader ) + sizeof( TReqFunNegotiateParams );
     Result = isoExchangeBuffer(NULL, IsoSize);
-    if ((Result == 0) && (IsoSize == int(sizeof(TS7ResHeader23) + sizeof(TResFunNegotiateParams))))
-    {
-        // Setup pointers
-        Answer = PS7ResHeader23(&PDU.Payload);
-        ResNegotiate = PResFunNegotiateParams(pbyte(Answer) + sizeof(TS7ResHeader23));
-        if ( Answer->Error != 0 )
-	    Result = SetError(errNegotiatingPDU);
-        if ( Result == 0 )
-	    PDULength = SwapWord(ResNegotiate->PDULength);
-    }
-    return Result;
+    if (Result != 0)
+        return Result;
+    if (IsoSize != ResHeaderSize23 + int(sizeof(TResFunNegotiateParams)))
+        return SetError(errNegotiatingPDU);
+
+    Answer = PS7ResHeader23(&PDU.Payload);
+    ResNegotiate = PResFunNegotiateParams(pbyte(Answer) + ResHeaderSize23);
+    const int Length = SwapWord(ResNegotiate->PDULength);
+    // Leave room for the WriteArea header and at least one four-byte element.
+    const int MinimumLength = ReqHeaderSize + 2 + sizeof(TReqFunWriteItem) + 4 + 4;
+    if (Answer->P != 0x32 || Answer->PDUType != PduType_response ||
+        Answer->Sequence != Sequence || Answer->Error != 0 ||
+        SwapWord(Answer->ParLen) != sizeof(TResFunNegotiateParams) ||
+        Answer->DataLen != 0 || ResNegotiate->FunNegotiate != pduNegotiate ||
+        Length < MinimumLength || Length > IsoPayload_Size || Length > PDURequest)
+        return SetError(errNegotiatingPDU);
+
+    PDULength = Length;
+    return 0;
 }
 //---------------------------------------------------------------------------
 void TSnap7Peer::PeerDisconnect( )
 {
+    PDULength=0;
     ClrError();
     isoDisconnect(true);
 }
@@ -110,6 +121,7 @@ int TSnap7Peer::PeerConnect( )
 {
     int Result;
 
+    PDULength=0;
     ClrError();
 	Result = isoConnect();
 	if (Result == 0)

@@ -53,7 +53,8 @@ int TIsoTcpSocket::CheckPDU(void *pPDU, u_char PduTypeExpected)
 		Info = PIsoHeaderInfo(pPDU);
 		Size = PDUSize(pPDU);
 		// Performs check
-		if (( Size<7 ) || ( Size>IsoPayload_Size ) ||  // Checks RFC 1006 header length
+		if (Info->TPKT.Version != isoTcpVersion || Info->TPKT.Reserved != 0 ||
+            ( Size<7 ) || ( Size>int(IsoFrameSize) ) ||  // Checks RFC 1006 header length
 			( Info->HLength<sizeof( TCOTP_DT )-1 ) ||  // Checks ISO 8073 header length
 			( Info->PDUType!=PduTypeExpected))         // Checks PDU Type
 		  return SetIsoError(errIsoInvalidPDU);
@@ -305,6 +306,13 @@ int TIsoTcpSocket::isoExchangeBuffer(void *Data, int &Size)
 	Result =isoSendBuffer(Data, Size);
 	if (Result==0)
 		Result =isoRecvBuffer(Data, Size);
+    if (Result == 0 && PDU.COTP.PDUType != pdu_type_DT)
+        Result = SetIsoError(errIsoInvalidPDU);
+    if (Result != 0)
+    {
+        ForceClose();
+        Connected = false;
+    }
 	return Result;
 }
 //---------------------------------------------------------------------------
@@ -385,6 +393,8 @@ int TIsoTcpSocket::isoRecvFragment(void *From, int Max, int &Size, bool &EoT)
 				EoT=true;
 				break;
 			case pdu_type_DT:
+                if (PDU.COTP.HLength != sizeof(TCOTP_DT) - 1)
+                    return SetIsoError(errIsoInvalidPDU);
                 EoT = (PDU.COTP.EoT_Num & 0x80) == 0x80;  // EoT flag
 				break;
 			default:
@@ -452,9 +462,8 @@ int TIsoTcpSocket::isoRecvPDU(PIsoDataPDU Data)
 	Offset =0;
 	Complete =false;
     ClrIsoError();
-	pData = pbyte(&PDU.Payload);
 	do {
-		pData=pData+Offset;
+		pData=pbyte(&PDU.Payload)+Offset;
 		max =IsoPayload_Size-Offset; // Maximum packet allowed
 		if (max>0)
 		{

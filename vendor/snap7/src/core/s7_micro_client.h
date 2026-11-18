@@ -287,10 +287,11 @@ protected:
     word ConnectionType;
     longword JobStart;
     TSnap7Job Job;
-    int DataSizeByte(int WordLength);
     int opSize; // last operation size
     int PerformOperation();
 public:
+    size_t LastWriteBytes;
+    static int DataSizeByte(int WordLength);
     TS7Buffer opData;
 	TSnap7MicroClient();
     ~TSnap7MicroClient();

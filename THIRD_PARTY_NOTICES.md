@@ -16,3 +16,8 @@ when the header is parsed in the C++17 Node addon build.
 
 The binding code in this package is MIT-licensed. Distribution of a binary
 that incorporates Snap7 must also satisfy the applicable LGPL requirements.
+
+Changes to the vendored client include bounds checks for ISO reassembly, PDU
+negotiation and single-area I/O, TCP connect and frame handling, and tracking
+of acknowledged write bytes. The modified sources are included in the npm
+package.

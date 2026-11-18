@@ -23,7 +23,7 @@
       ],
       "defines": [
         "NAPI_VERSION=8",
-        "NAPI_DISABLE_CPP_EXCEPTIONS"
+        "NODE_ADDON_API_CPP_EXCEPTIONS_ALL"
       ],
       "conditions": [
         [

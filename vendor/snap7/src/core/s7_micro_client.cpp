@@ -40,6 +40,7 @@ TSnap7MicroClient::TSnap7MicroClient()
 	SrcTSap =0x0100;
 	DstTSap =0x0000; // It's filled by connection functions
     ConnectionType = CONNTYPE_PG; // Default connection type
+    LastWriteBytes = 0;
 	memset(&Job,0,sizeof(TSnap7Job));
 }
 //---------------------------------------------------------------------------
@@ -64,7 +65,6 @@ int TSnap7MicroClient::opReadArea()
      int MaxElements;  // Max elements that we can transfer in a PDU
      word NumElements; // Num of elements that we are asking for this telegram
      int TotElements;  // Total elements requested
-     int Size;
      int Result;
 
      WordSize=DataSizeByte(Job.WordLen); // The size in bytes of an element that we are asking for
@@ -85,23 +85,27 @@ int TSnap7MicroClient::opReadArea()
      ResData   =PResFunReadItem(pbyte(ResParams)+sizeof(TResFunReadParams));
      // Each packet cannot exceed the PDU length (in bytes) negotiated, and moreover
      // we must ensure to transfer a "finite" number of item per PDU
-     MaxElements=(PDULength-sizeof(TS7ResHeader23)-sizeof(TResFunReadParams)-4) / WordSize;
+     const int ReplyOverhead = ResHeaderSize23 + sizeof(TResFunReadParams) + 4;
+     if (!Connected || PDULength == 0)
+        return errIsoDisconnect | LastTcpError;
+     MaxElements=(PDULength-ReplyOverhead) / WordSize;
+     if (MaxElements < 1)
+        return errCliSizeOverPDU;
      TotElements=Job.Amount;
      Start      =Job.Start;
      Offset     =0;
      Result     =0;
      while ((TotElements>0) && (Result==0))
      {
-          NumElements=TotElements;
-          if (NumElements>MaxElements)
-             NumElements=MaxElements;
+          NumElements=TotElements < MaxElements ? TotElements : MaxElements;
 
           Target=pbyte(Job.pData)+Offset;
           //----------------------------------------------- Read next slice-----
           PDUH_out->P = 0x32;                    // Always 0x32
           PDUH_out->PDUType = PduType_request;   // 0x01
           PDUH_out->AB_EX = 0x0000;              // Always 0x0000
-          PDUH_out->Sequence = GetNextWord();    // AutoInc
+          const word Sequence = GetNextWord();
+          PDUH_out->Sequence = Sequence;
           PDUH_out->ParLen = SwapWord(RPSize);   // 14 bytes params
           PDUH_out->DataLen = 0x0000;            // No data
 
@@ -131,33 +135,54 @@ int TSnap7MicroClient::opReadArea()
 
           IsoSize = sizeof(TS7ReqHeader)+RPSize;
           Result = isoExchangeBuffer(0,IsoSize);
-          // Get Data
-          if (Result==0)  // 1St level Iso
+          if (Result != 0)
+             return Result;
+          if (IsoSize < ResHeaderSize23 || IsoSize > PDULength ||
+              Answer->P != 0x32 || Answer->PDUType != PduType_response ||
+              Answer->Sequence != Sequence)
+             return errCliInvalidPlcAnswer;
+          if (Answer->Error != 0)
+             return CpuError(SwapWord(Answer->Error));
+          if (IsoSize < ReplyOverhead ||
+              SwapWord(Answer->ParLen) != sizeof(TResFunReadParams) ||
+              SwapWord(Answer->DataLen) != IsoSize - ResHeaderSize23 - sizeof(TResFunReadParams) ||
+              ResParams->FunRead != pduFuncRead || ResParams->ItemCount != 1)
+             return errCliInvalidPlcAnswer;
+          if (ResData->ReturnCode != 0xFF)
+             return CpuError(ResData->ReturnCode);
+
+          const int Expected = NumElements * WordSize;
+          const int Length = SwapWord(ResData->DataLength);
+          bool ValidLength;
+          switch (ResData->TransportSize)
           {
-               Size = 0;
-               // Item level error
-                if (ResData->ReturnCode==0xFF) // <-- 0xFF means Result OK
-                {
-                   // Calcs data size in bytes
-                   Size = SwapWord(ResData->DataLength);
-                   // Adjust Size in accord of TransportSize
-                   if ((ResData->TransportSize != TS_ResOctet) && (ResData->TransportSize != TS_ResReal) && (ResData->TransportSize != TS_ResBit))
-                       Size = Size >> 3;
-                   memcpy(Target, &ResData->Data[0], Size);
-                }
-                else
-                     Result = CpuError(ResData->ReturnCode);
-           Offset+=Size;
-          };
+              case TS_ResBit:
+              case TS_ResReal:
+              case TS_ResOctet:
+                  ValidLength = Length == Expected;
+                  break;
+              case TS_ResByte:
+              case TS_ResInt:
+                  ValidLength = Length == Expected * 8;
+                  break;
+              default:
+                  ValidLength = false;
+                  break;
+          }
+          if (!ValidLength || Expected > IsoSize - ReplyOverhead)
+             return errCliInvalidDataSizeRecvd;
+          memcpy(Target, ResData->Data, Expected);
+          Offset += Expected;
           //--------------------------------------------------------------------
           TotElements -= NumElements;
-          Start += NumElements*WordSize;
+          Start += NumElements * ((Job.WordLen == S7WLCounter || Job.WordLen == S7WLTimer) ? 1 : WordSize);
      }
      return Result;
 }
 //---------------------------------------------------------------------------
 int TSnap7MicroClient::opWriteArea()
 {
+     LastWriteBytes = 0;
      PReqFunWriteParams   ReqParams;
      PReqFunWriteDataItem ReqData;  // only 1 item for WriteArea Function
      PResFunWrite         ResParams;
@@ -203,21 +228,24 @@ int TSnap7MicroClient::opWriteArea()
 
      // Each packet cannot exceed the PDU length (in bytes) negotiated, and moreover
      // we must ensure to transfer a "finite" number of item per PDU
+     if (!Connected || PDULength == 0)
+        return errIsoDisconnect | LastTcpError;
      MaxElements=(PDULength-RHSize) / WordSize;
+     if (MaxElements < 1)
+        return errCliSizeOverPDU;
      TotElements=Job.Amount;
      Start      =Job.Start;
      while ((TotElements>0) && (Result==0))
      {
-           NumElements=TotElements;
-           if (NumElements>MaxElements)
-               NumElements=MaxElements;
+           NumElements=TotElements < MaxElements ? TotElements : MaxElements;
            Source=pbyte(Job.pData)+Offset;
 
            Size=NumElements * WordSize;
            PDUH_out->P=0x32;                    // Always 0x32
            PDUH_out->PDUType=PduType_request;   // 0x01
            PDUH_out->AB_EX=0x0000;              // Always 0x0000
-           PDUH_out->Sequence=GetNextWord();    // AutoInc
+           const word Sequence = GetNextWord();
+           PDUH_out->Sequence = Sequence;
            PDUH_out->ParLen  =SwapWord(RPSize); // 14 bytes params
            PDUH_out->DataLen =SwapWord(Size+4);
 
@@ -275,17 +303,27 @@ int TSnap7MicroClient::opWriteArea()
            else
                ReqData->DataLength=SwapWord(Size);
 
-           memcpy(Target, Source, Size);
            IsoSize=RHSize + Size;
+           if (IsoSize > IsoPayload_Size)
+               return errCliSizeOverPDU;
+           memcpy(Target, Source, Size);
            Result=isoExchangeBuffer(0,IsoSize);
 
            if (Result==0) // 1St check : Iso result
            {
+               if (IsoSize < ResHeaderSize23 || IsoSize > PDULength ||
+                   Answer->P != 0x32 || Answer->PDUType != PduType_response ||
+               Answer->Sequence != Sequence)
+                   return errCliInvalidPlcAnswer;
                Result=CpuError(SwapWord(Answer->Error)); // 2nd level global error
                if (Result==0)
-               {     // 2th check : item error
-                   if (ResParams->Data[0] == 0xFF) // <-- 0xFF means Result OK
-                       Result=0;
+               {
+                   if (IsoSize != ResHeaderSize23 + 3 || SwapWord(Answer->ParLen) != 2 ||
+                       SwapWord(Answer->DataLen) != 1 || ResParams->FunWrite != pduFuncWrite ||
+                       ResParams->ItemCount != 1)
+                       return errCliInvalidPlcAnswer;
+                   if (ResParams->Data[0] == 0xFF)
+                       LastWriteBytes += Size;
                    else
                        // Now we check the error : if it's the first part we report the cpu error
                        // otherwise we warn that the function failed but some data were written
@@ -299,7 +337,7 @@ int TSnap7MicroClient::opWriteArea()
            First=false;
 
            TotElements-=NumElements;
-           Start+=(NumElements*WordSize);
+           Start += NumElements * ((Job.WordLen == S7WLCounter || Job.WordLen == S7WLTimer) ? 1 : WordSize);
      }
      return Result;
 }

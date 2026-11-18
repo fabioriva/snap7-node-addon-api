@@ -1,6 +1,7 @@
 name: Build prebuilt binaries
 
 on:
+  pull_request:
   push:
     tags:
       - 'v*'
@@ -8,12 +9,18 @@ on:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build on ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022]
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64
+          - os: ubuntu-22.04-arm
+            target: linux-arm64
+          - os: windows-2022
+            target: win32-x64
 
     steps:
       - name: Checkout
@@ -37,30 +44,69 @@ jobs:
           arch: x64
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
-      - name: Build native addon on Windows
-        if: runner.os == 'Windows'
-        shell: cmd
-        env:
-          npm_config_msvs_version: 2022
-          GYP_MSVS_VERSION: 2022
-        run: |
-          set
-          npm run build
-
-      - name: Build native addon on Linux
+      - name: Allow the loopback test to listen on the S7 port
         if: runner.os == 'Linux'
+        run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=102
+
+      - name: Test with ASan and UBSan
+        if: matrix.target == 'linux-x64'
+        env:
+          SNAP7_TEST_LOOPBACK: '1'
+          CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+        run: |
+          npm run build
+          LD_PRELOAD="$(g++ -print-file-name=libasan.so)" \
+            ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+            UBSAN_OPTIONS=halt_on_error=1 \
+            node --test --experimental-test-isolation=none
+
+      - name: Build from source
+        env:
+          GYP_MSVS_VERSION: 2022
+          npm_config_msvs_version: 2022
         run: npm run build
 
-      - name: Create prebuilt binaries
-        run: npx prebuildify --strip --napi
+      - name: Test source build
+        env:
+          SNAP7_TEST_LOOPBACK: '1'
+        run: npm test
 
-      - name: Upload prebuild artifacts
+      - name: Create prebuilt binary
+        shell: bash
+        env:
+          GYP_MSVS_VERSION: 2022
+          npm_config_msvs_version: 2022
+        run: |
+          args=(--target "$(node -p 'process.versions.node')")
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            args+=(--tag-libc)
+          fi
+          npm run build:prebuilt -- "${args[@]}"
+
+      - name: Test prebuilt binary
+        env:
+          PREBUILDS_ONLY: '1'
+          SNAP7_TEST_LOOPBACK: '1'
+        run: npm test
+
+      - name: Smoke-test npm tarball
+        shell: bash
+        env:
+          PREBUILDS_ONLY: '1'
+        run: |
+          tarball=$(npm pack --silent)
+          npm install --prefix package-smoke --no-audit "./$tarball"
+          cd package-smoke
+          node -e 'const { S7Client } = require("snap7-node-addon-api"); new S7Client().disconnect().catch(e => { console.error(e); process.exitCode = 1; })'
+
+      - name: Upload prebuild artifact
         uses: actions/upload-artifact@v4
         with:
-          name: prebuilds-${{ runner.os }}
-          path: prebuilds/**
+          name: prebuild-${{ matrix.target }}
+          path: prebuilds/${{ matrix.target }}/
           if-no-files-found: error
 
   publish:
@@ -82,8 +128,16 @@ jobs:
       - name: Download prebuild artifacts
         uses: actions/download-artifact@v4
         with:
-          path: prebuilds
-          merge-multiple: true
+          pattern: prebuild-*
+          path: release-prebuilds
+
+      - name: Assemble prebuilds
+        shell: bash
+        run: |
+          for target in linux-x64 linux-arm64 win32-x64; do
+            mkdir -p "prebuilds/$target"
+            cp release-prebuilds/"prebuild-$target"/*.node "prebuilds/$target/"
+          done
 
       - name: Publish to npm
         run: npm publish
